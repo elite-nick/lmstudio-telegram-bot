@@ -1,6 +1,6 @@
-  # lmstudio-telegram-bot
+  # LM Studio Telegram Bot (Fork with support for image analysis and Telegram timeout fix)
   
-  this is a telegram bot that integrates with lmstudio's openai compatible api server providing chat, completion, and embeddings. it supports multiple conversation threads, custom system prompts, and manual or automatic summarization that gets stored to a local sqlite database.
+  This is a telegram bot that integrates with lmstudio's openai compatible api server providing chat, completion, and embeddings. it supports multiple conversation threads, custom system prompts, and manual or automatic summarization that gets stored to a local sqlite database.
   
   ## features
   
@@ -48,5 +48,3 @@
   - **list_models**: list all lm studio models
   - **completion**: use the legacy completion endpoint
   - **embedding**: get an embedding for input text
-  
-
