@@ -5,11 +5,13 @@ import time
 import os
 import asyncio
 import base64
+import random
 from io import BytesIO
 from dotenv import load_dotenv
+from collections import deque
 
 from telegram import Update, User
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,7 +36,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not set")
+    raise RuntimeError("BOT_TOKEN is not set")
 
 # ------------------------------------------------------------------------------
 # LM Studio
@@ -46,10 +48,22 @@ DEFAULT_MODEL = "llava"
 TOKEN_THRESHOLD = 12000
 
 conversation_params = {
-    "max_tokens": 400,
-    "temperature": 0.7,
+    "max_tokens": 700,
+    "temperature": 0.4,
     "top_p": 1.0,
 }
+
+# ------------------------------------------------------------------------------
+# Runtime state
+# ------------------------------------------------------------------------------
+USER_QUEUES = {}
+USER_PROCESSING = set()
+
+UNSUPPORTED_STICKER_MESSAGES = [
+    "😅 This sticker is too lively for me — I only understand regular images or static stickers...",
+    "🤖 Oops, I can’t recognize animated stickers yet...",
+    "🎬 Looks cool! But I can’t read animated or video stickers."
+]
 
 # ------------------------------------------------------------------------------
 # Database
@@ -151,6 +165,20 @@ def get_messages(cid):
     return [{"role": r[0], "content": r[1]} for r in rows]
 
 
+def clear_user_history(user_id):
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT id FROM conversations WHERE user_id=?", (user_id,))
+        ids = [r[0] for r in c.fetchall()]
+
+        for cid in ids:
+            conn.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
+        conn.execute("DELETE FROM conversations WHERE user_id=?", (user_id,))
+        conn.execute(
+            "UPDATE user_settings SET active_conversation_id=NULL WHERE user_id=?",
+            (user_id,),
+        )
+
 # ------------------------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------------------------
@@ -165,8 +193,11 @@ def trim_messages(messages, max_chars=TOKEN_THRESHOLD):
     return list(reversed(result))
 
 
+def image_to_b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
 # ------------------------------------------------------------------------------
-# LM Studio helpers
+# LM Studio
 # ------------------------------------------------------------------------------
 def call_lm_chat(messages, model):
     payload = {
@@ -174,18 +205,9 @@ def call_lm_chat(messages, model):
         "messages": messages,
         **conversation_params,
     }
-
-    r = requests.post(
-        LM_CHAT,
-        json=payload,
-        timeout=180,
-    )
+    r = requests.post(LM_CHAT, json=payload, timeout=180)
     r.raise_for_status()
     return r.json()
-
-
-def image_to_b64(data: bytes) -> str:
-    return base64.b64encode(data).decode()
 
 
 def call_lm_vision(image_b64, prompt, model):
@@ -205,58 +227,155 @@ def call_lm_vision(image_b64, prompt, model):
                 ],
             }
         ],
-        "max_tokens": 500,
+        "max_tokens": 700,
     }
-
     r = requests.post(LM_CHAT, json=payload, timeout=240)
     r.raise_for_status()
     return r.json()
 
+# ------------------------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------------------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Hi! I’m LM Studio Telegram Bot!\n\n"
+        "Here’s what I can do:\n"
+        "• Chat via text (sometimes with emojis)\n"
+        "• Analyze your images and stickers\n\n"
+        "Commands:\n"
+        "/status — current status (works only while generating a reply)\n"
+        "/clear — clear our conversation history\n\n"
+    )
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid in USER_PROCESSING:
+        q = len(USER_QUEUES.get(uid, []))
+        await update.message.reply_text(
+            f"🤖 I’m thinking right now.\n"
+            f"📨 Messages in queue: {q}"
+        )
+    else:
+        await update.message.reply_text("💤 I’m free and ready to reply.")
+
+
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_user_history(update.effective_user.id)
+    await update.message.reply_text("🧹 History cleared.")
 
 # ------------------------------------------------------------------------------
-# Handlers
+# Text chat with queue + reply
 # ------------------------------------------------------------------------------
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    text = update.message.text
+    uid = user.id
 
     upsert_user(user)
-    s = get_settings(user.id)
 
-    cid = s["cid"]
-    if not cid:
-        cid = create_conversation(user.id, s["model"])
-        set_active_conversation(user.id, cid)
+    if uid not in USER_QUEUES:
+        USER_QUEUES[uid] = deque()
 
-    append_message(cid, "user", text)
+    USER_QUEUES[uid].append({
+        "text": update.message.text,
+        "message_id": update.message.message_id,
+        "chat_id": update.effective_chat.id
+    })
 
-    sent = await update.message.reply_text("🤖 Im writing a reply, please wait a moment...")
-
-    msgs = trim_messages(get_messages(cid))
-
-    try:
-        data = await asyncio.to_thread(call_lm_chat, msgs, s["model"])
-        answer = data["choices"][0]["message"]["content"]
-    except Exception as e:
-        await sent.edit_text(f"Error LM Studio:\n{e}")
+    if uid in USER_PROCESSING:
+        await update.message.reply_text(
+            "⏳ I’m already answering a previous question.\n"
+            "I’ll respond to this one right after."
+        )
         return
 
-    append_message(cid, "assistant", answer)
+    asyncio.create_task(process_user_queue(uid, context))
+
+
+async def process_user_queue(user_id, context: ContextTypes.DEFAULT_TYPE):
+    USER_PROCESSING.add(user_id)
 
     try:
-        await sent.edit_text(answer, parse_mode=ParseMode.MARKDOWN)
-    except Exception:
+        while USER_QUEUES[user_id]:
+            item = USER_QUEUES[user_id].popleft()
+
+            text = item["text"]
+            reply_to = item["message_id"]
+            chat_id = item["chat_id"]
+
+            s = get_settings(user_id)
+            cid = s["cid"]
+            if not cid:
+                cid = create_conversation(user_id, s["model"])
+                set_active_conversation(user_id, cid)
+
+            append_message(cid, "user", text)
+
+            sent = await context.bot.send_message(
+                chat_id=chat_id,
+                text="🤖 Thinking...",
+                reply_to_message_id=reply_to
+            )
+
+            msgs = trim_messages(get_messages(cid))
+
+            data = await asyncio.to_thread(
+                call_lm_chat, msgs, s["model"]
+            )
+            answer = data["choices"][0]["message"]["content"]
+
+            append_message(cid, "assistant", answer)
+
+            await sent.edit_text(answer, parse_mode=ParseMode.MARKDOWN)
+
+    finally:
+        USER_PROCESSING.discard(user_id)
+
+# ------------------------------------------------------------------------------
+# Stickers (reply)
+# ------------------------------------------------------------------------------
+async def sticker_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sticker = update.message.sticker
+
+    if sticker.is_animated or sticker.is_video:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=answer,
-            parse_mode=ParseMode.MARKDOWN,
+            text=random.choice(UNSUPPORTED_STICKER_MESSAGES),
+            reply_to_message_id=update.message.message_id
         )
+        return
 
+    file = await sticker.get_file()
+    bio = BytesIO()
+    await file.download_to_memory(out=bio)
 
+    image_b64 = image_to_b64(bio.getvalue())
+    prompt = (
+        "I sent a sticker as a reply to your message. You can react to it. "
+        "Respond while taking into account the context of the attached sticker image, "
+        "which may contain anything drawn or written. You may also describe what is "
+        "shown in the sticker image."
+    )
+
+    s = get_settings(update.effective_user.id)
+
+    sent = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="😀 Analyzing sticker...",
+        reply_to_message_id=update.message.message_id
+    )
+
+    data = await asyncio.to_thread(
+        call_lm_vision, image_b64, prompt, s["model"]
+    )
+    answer = data["choices"][0]["message"]["content"]
+
+    await sent.edit_text(answer)
+
+# ------------------------------------------------------------------------------
+# Images (reply)
+# ------------------------------------------------------------------------------
 async def image_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    upsert_user(user)
-
     photo = update.message.photo[-1]
     file = await photo.get_file()
 
@@ -264,33 +383,28 @@ async def image_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await file.download_to_memory(out=bio)
 
     image_b64 = image_to_b64(bio.getvalue())
-    prompt = update.message.caption or "Describe image"
+    prompt = update.message.caption or "Describe the image"
 
-    s = get_settings(user.id)
+    s = get_settings(update.effective_user.id)
 
-    sent = await update.message.reply_text("🖼 Analyzing image...")
+    sent = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🖼 Analyzing image...",
+        reply_to_message_id=update.message.message_id
+    )
 
-    try:
-        data = await asyncio.to_thread(
-            call_lm_vision, image_b64, prompt, s["model"]
-        )
-        answer = data["choices"][0]["message"]["content"]
-    except Exception as e:
-        await sent.edit_text(f"Vision error:\n{e}")
-        return
+    data = await asyncio.to_thread(
+        call_lm_vision, image_b64, prompt, s["model"]
+    )
+    answer = data["choices"][0]["message"]["content"]
 
-    try:
-        await sent.edit_text(answer)
-    except Exception:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=answer,
-        )
+    await sent.edit_text(answer)
 
-
+# ------------------------------------------------------------------------------
+# Errors
+# ------------------------------------------------------------------------------
 async def error_handler(update, context):
     logger.error("Unhandled error", exc_info=context.error)
-
 
 # ------------------------------------------------------------------------------
 # Main
@@ -313,6 +427,11 @@ def main():
 
     app.add_error_handler(error_handler)
 
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("clear", clear_cmd))
+
+    app.add_handler(MessageHandler(filters.Sticker.ALL, sticker_chat))
     app.add_handler(MessageHandler(filters.PHOTO, image_chat))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
